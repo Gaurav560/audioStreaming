@@ -14,7 +14,6 @@ import org.springframework.web.socket.WebSocketSession;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
-import java.time.Duration;
 import java.util.Map;
 
 @Slf4j
@@ -74,40 +73,48 @@ public class TtsStreamService {
      */
     public Mono<Void> streamSpeechToBrowser(Flux<String> gptTokenStream, WebSocketSession session) {
         return gptTokenStream
-                .bufferTimeout(100, Duration.ofMillis(500)) // Collect tokens into chunks
-                .map(tokens -> String.join("", tokens))
-                .filter(text -> !text.trim().isEmpty())
-                // Group into sentences for better TTS quality
-                .scan(new SentenceAccumulator(), (acc, text) -> {
-                    acc.append(text);
-                    return acc;
-                })
-                .filter(SentenceAccumulator::hasCompleteSentence)
-                .concatMap(acc -> {
-                    String sentence = acc.extractSentence();
-                    log.info("📝 Processing sentence: {}", sentence);
+                .onBackpressureBuffer() // Handle backpressure by buffering
+                .collect(StringBuilder::new, StringBuilder::append) // Collect all tokens
+                .flatMap(fullText -> {
+                    String text = fullText.toString().trim();
+                    if (text.isEmpty()) {
+                        return Mono.empty();
+                    }
 
-                    // Send text to browser first
-                    return Mono.fromRunnable(() -> {
-                                try {
-                                    String json = String.format("{\"type\":\"bot_text\",\"data\":\"%s\"}",
-                                            sentence.replace("\"", "\\\""));
-                                    session.sendMessage(new TextMessage(json));
-                                } catch (Exception e) {
-                                    log.error("Error sending text message: {}", e.getMessage());
-                                }
-                            })
-                            .then(synthesizeToBytes(sentence))
-                            .flatMap(mp3Bytes -> {
-                                // Send audio chunks to browser
+                    log.info("📝 Full GPT response received: {}", text);
+
+                    // Split into sentences
+                    String[] sentences = text.split("(?<=[.!?])\\s+");
+
+                    // Process each sentence sequentially
+                    return Flux.fromArray(sentences)
+                            .filter(s -> !s.trim().isEmpty())
+                            .concatMap(sentence -> {
+                                log.info("📝 Processing sentence: {}", sentence);
+
+                                // Send text to browser first
                                 return Mono.fromRunnable(() -> {
-                                    try {
-                                        session.sendMessage(new BinaryMessage(mp3Bytes));
-                                    } catch (Exception e) {
-                                        log.error("Error sending audio: {}", e.getMessage());
-                                    }
-                                });
-                            });
+                                            try {
+                                                String json = String.format("{\"type\":\"bot_text\",\"data\":\"%s\"}",
+                                                        sentence.replace("\"", "\\\"").replace("\n", "\\n"));
+                                                session.sendMessage(new TextMessage(json));
+                                            } catch (Exception e) {
+                                                log.error("Error sending text message: {}", e.getMessage());
+                                            }
+                                        })
+                                        .then(synthesizeToBytes(sentence))
+                                        .flatMap(mp3Bytes -> {
+                                            // Send audio chunks to browser
+                                            return Mono.fromRunnable(() -> {
+                                                try {
+                                                    session.sendMessage(new BinaryMessage(mp3Bytes));
+                                                } catch (Exception e) {
+                                                    log.error("Error sending audio: {}", e.getMessage());
+                                                }
+                                            });
+                                        });
+                            })
+                            .then();
                 })
                 // Send end marker
                 .then(Mono.fromRunnable(() -> {
@@ -118,32 +125,10 @@ public class TtsStreamService {
                     }
                 }))
                 .doOnError(err -> log.error("❌ Stream error: {}", err.getMessage()))
+                .onErrorResume(err -> {
+                    log.error("❌ Recovering from stream error: {}", err.getMessage());
+                    return Mono.empty();
+                })
                 .then();
-    }
-
-    /**
-     * Helper class to accumulate tokens into complete sentences.
-     */
-    private static class SentenceAccumulator {
-        private final StringBuilder buffer = new StringBuilder();
-        private String lastSentence = null;
-
-        void append(String text) {
-            buffer.append(text);
-        }
-
-        boolean hasCompleteSentence() {
-            String text = buffer.toString();
-            // Check for sentence-ending punctuation
-            return text.matches(".*[.!?]\\s*$") ||
-                    text.length() > 200; // Force break if too long
-        }
-
-        String extractSentence() {
-            String sentence = buffer.toString().trim();
-            buffer.setLength(0); // Clear buffer
-            lastSentence = sentence;
-            return sentence;
-        }
     }
 }
